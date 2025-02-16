@@ -1,0 +1,162 @@
+- hosts: mysql_master
+  become: yes
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+  tasks:
+    - name: Instalar MySQL en el maestro
+      apt:
+        name: mysql-server
+        state: present
+        update_cache: yes
+
+    - name: Instalar librería de Python para MySQL en el maestro (PyMySQL)
+      apt:
+        name: python3-pymysql
+        state: present
+
+    - name: Configurar la contraseña de root en el maestro
+      shell: |
+        sudo mysql <<EOF
+        ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY 'usuario';
+        FLUSH PRIVILEGES;
+        EOF
+      args:
+        executable: /bin/bash
+      ignore_errors: yes
+
+    - name: Configurar my.cnf del maestro
+      blockinfile:
+        path: /etc/mysql/mysql.conf.d/mysqld.cnf
+        block: |
+          [mysqld]
+          server-id = 1
+          log_bin = /var/log/mysql/mysql-bin.log
+          bind-address = 0.0.0.0
+      notify: Reiniciar MySQL
+
+    - name: Crear usuario de replicación
+      mysql_user:
+        name: replicator
+        host: '%'
+        password: 'usuario'
+        priv: '*.*:REPLICATION SLAVE'
+        state: present
+        login_user: root
+        login_password: 'usuario'
+
+    - name: Bloquear tablas y obtener estado binario
+      command: mysql -u root -p'usuario' -e "FLUSH TABLES WITH READ LOCK; SHOW MASTER STATUS;"
+      register: master_status
+
+    - name: Crear dump de la base de datos
+      shell: mysqldump -u root -p'usuario' --all-databases --source-data=1 > /tmp/master_dump.sql
+      args:
+        executable: /bin/bash
+        creates: /tmp/master_dump.sql
+
+    - name: Copiar dump al directorio compartido
+      copy:
+        src: /tmp/master_dump.sql
+        dest: /vagrant/master_dump.sql
+        remote_src: yes
+
+    - name: Desbloquear tablas
+      command: mysql -u root -p'usuario' -e "UNLOCK TABLES;"
+
+    - name: Obtener posición binaria
+      set_fact:
+        binlog_file: "{{ master_status.stdout_lines[1].split()[0] }}"
+        binlog_pos: "{{ master_status.stdout_lines[1].split()[1] | int }}"
+
+  handlers:
+    - name: Reiniciar MySQL
+      service:
+        name: mysql
+        state: restarted
+
+- hosts: mysql_slave
+  become: yes
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+  tasks:
+    - name: Instalar MySQL en el esclavo
+      apt:
+        name: mysql-server
+        state: present
+        update_cache: yes
+
+    - name: Instalar librería de Python para MySQL en el esclavo (PyMySQL)
+      apt:
+        name: python3-pymysql
+        state: present
+
+    - name: Configurar contraseña root esclavo
+      shell: |
+        sudo mysql <<EOF
+        ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY 'usuario';
+        FLUSH PRIVILEGES;
+        EOF
+      args:
+        executable: /bin/bash
+      ignore_errors: yes
+
+
+    - name: Configurar my.cnf del esclavo
+      blockinfile:
+        path: /etc/mysql/mysql.conf.d/mysqld.cnf
+        block: |
+          [mysqld]
+          server-id = 2
+          relay-log = /var/log/mysql/mysql-relay-bin.log
+          bind-address = 0.0.0.0
+          read_only = 1
+      notify: Reiniciar MySQL
+
+    - name: Detener replicación antes de importar
+      shell: |
+        mysql -u root -p'usuario' -e "STOP SLAVE; RESET SLAVE ALL;"
+      args:
+        executable: /bin/bash
+      ignore_errors: yes
+
+    - name: Transferir dump del directorio compartido
+      copy:
+        src: /vagrant/master_dump.sql
+        dest: /tmp/master_dump.sql
+        remote_src: yes
+
+    - name: Importar dump
+      shell: mysql -u root -p'usuario' < /tmp/master_dump.sql
+      args:
+        removes: /tmp/master_dump.sql
+
+    - name: Configurar replicación
+      shell: |
+        mysql -u root -p'usuario' -e "STOP SLAVE; \
+        CHANGE MASTER TO \
+        MASTER_HOST='192.168.57.101', \
+        MASTER_USER='replicator', \
+        MASTER_PASSWORD='usuario', \
+        MASTER_LOG_FILE='{{ hostvars['mysql-master'].binlog_file }}', \
+        MASTER_LOG_POS={{ hostvars['mysql-master'].binlog_pos }}; \
+        START SLAVE;"
+      args:
+        executable: /bin/bash
+
+    - name: Verificar estado replicación
+      shell: |
+        mysql -u root -p'usuario' -e "SHOW SLAVE STATUS\G" | grep -E 'Slave_IO_Running|Slave_SQL_Running'
+      register: replication_status
+      failed_when: 
+        - "'Slave_IO_Running: Yes' not in replication_status.stdout"
+        - "'Slave_SQL_Running: Yes' not in replication_status.stdout"
+
+    - name: Mostrar estado replicación
+      debug:
+        var: replication_status.stdout
+
+  handlers:
+    - name: Reiniciar MySQL
+      service:
+        name: mysql
+        state: restarted
