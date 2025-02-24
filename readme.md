@@ -65,5 +65,4 @@ Si la base de datos `prueba_replica1` aparece en el esclavo y el estado del escl
 
 ---
 
-⚡ **Ahora tu entorno está listo!** Si tienes problemas, revisa los logs y asegúrate de seguir cada paso correctamente. 🚀
 
